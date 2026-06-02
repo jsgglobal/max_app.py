@@ -37,6 +37,9 @@ if 'image_processed' not in st.session_state:
 if 'uploader_key' not in st.session_state:
     st.session_state['uploader_key'] = 0
 
+if 'scan_results' not in st.session_state:
+    st.session_state['scan_results'] = None
+
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {"role": "system", "content": "너는 월스트리트 최고의 펀더멘털 주식 애널리스트이자 퀀트 투자 전문가야. 사용자가 특정 종목의 뉴스, 재무제표, 실적, 악재, 전망을 물어보면 전문적이고 냉철한 시각으로 가독성 있게 요약 및 분석해줘."}
@@ -54,6 +57,9 @@ def reset_app():
     st.session_state['ticker_val'] = ""
     st.session_state['image_processed'] = False
     st.session_state['uploader_key'] += 1 
+
+def reset_scan():
+    st.session_state['scan_results'] = None
 
 # ==========================================
 # 2. 핵심 금융 데이터 수집 및 보조지표 계산 엔진
@@ -109,20 +115,21 @@ def analyze_signal(df):
     return [disp_signal, rsi_signal, bb_signal, macd_signal, stoch_signal, obv_signal]
 
 # ==========================================
-# 🔥 [NEW ENGINE] 무조건 검색 보장형 MTF 상대평가 스캐너
+# 🔥 [NEW ENGINE] 5대 전략 동시 랭킹 스캐너 (10,000개 최적화)
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_huge_ticker_list():
-    """10,000개 이상의 미국 전체 티커를 끌어오거나, 실패시 S&P 1500을 끌어옵니다."""
     tickers = set()
+    # 1. 10,000+ 티커 마스터 리스트 확보
     try:
         url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all/all_tickers.txt"
-        res = requests.get(url, timeout=5)
+        res = requests.get(url, timeout=10)
         if res.status_code == 200:
             for t in res.text.split('\n'):
                 if t.strip() and '^' not in t and '.' not in t: tickers.add(t.strip())
     except: pass
     
+    # 2. 통신 에러 대비 S&P 1500 백업 데이터 수집
     if len(tickers) < 1000:
         urls = [
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
@@ -132,27 +139,24 @@ def fetch_huge_ticker_list():
         headers = {'User-Agent': 'Mozilla/5.0'}
         for url in urls:
             try:
-                res = requests.get(url, headers=headers)
+                res = requests.get(url, headers=headers, timeout=5)
                 tables = pd.read_html(StringIO(res.text))
                 for df in tables:
                     t_col = next((col for col in df.columns if col in ['Symbol', 'Ticker']), None)
                     if t_col:
                         for t in df[t_col].astype(str).tolist(): tickers.add(t.replace('.', '-'))
             except: pass
+    
+    # 리스트 변환 후 유효한 종목만 반환
     return list(tickers)
 
-def analyze_stock_mtf_scanner(ticker, period_val, interval_val, preset_mode):
-    """
-    무조건 점수를 반환하는 랭킹형(상대평가) 분석 함수.
-    조건 미달이라도 0점 처리하여 결과 배열에 담습니다. (추후 상위 50개만 필터링)
-    """
+def analyze_stock_multi_strategy(ticker, period_val, interval_val):
     try:
         clean_ticker = str(ticker).replace('.', '-').strip()
         stock = yf.Ticker(clean_ticker)
         hist = stock.history(period=period_val, interval=interval_val)
         
-        # 데이터가 너무 적으면 분석 불가 (유일한 하드 필터)
-        if hist.empty or len(hist) < 65: return None
+        if hist.empty or len(hist) < 120: return None
         
         close = hist['Close']
         open_px = hist['Open']
@@ -161,19 +165,25 @@ def analyze_stock_mtf_scanner(ticker, period_val, interval_val, preset_mode):
         volume = hist['Volume']
         current_price = close.iloc[-1]
         
-        # 💡 [필터 대폭 완화] 5분/15분봉 초단타를 위해 거래량 제한을 매우 낮춤 (잡주/동전주만 배제)
+        # 유동성 필터
         vol_ma20 = volume.rolling(20).mean().iloc[-1]
-        if vol_ma20 < 100 or current_price < 0.5: return None 
+        if vol_ma20 < 1000 or current_price < 0.5: return None 
 
+        ma120 = close.rolling(120).mean()
         ma60 = close.rolling(60).mean()
         ma20 = close.rolling(20).mean()
         ma5 = close.rolling(5).mean()
         
-        # 보조지표 연산
-        trend_60_slope = (ma60.iloc[-1] - ma60.iloc[-10]) / ma60.iloc[-10] * 100
-        disp_20 = (current_price / ma20.iloc[-1]) * 100
+        bb_middle = close.rolling(20).mean()
+        bb_std = close.rolling(20).std()
+        bb_upper = bb_middle + (bb_std * 2)
+        bb_lower = bb_middle - (bb_std * 2)
+        bb_width = (bb_upper - bb_lower) / bb_middle * 100
         
+        disp_20 = (current_price / ma20.iloc[-1]) * 100
         vol_ratio = volume.iloc[-1] / vol_ma20 if vol_ma20 > 0 else 1.0
+        bullish_reversal = close.iloc[-1] > open_px.iloc[-1]
+        lower_tail = (min(open_px.iloc[-1], close.iloc[-1]) - low.iloc[-1]) / current_price > 0.01 
         
         typical_price = (high + low + close) / 3
         rolling_vwap = (typical_price * volume).rolling(20).sum() / volume.rolling(20).sum()
@@ -184,89 +194,67 @@ def analyze_stock_mtf_scanner(ticker, period_val, interval_val, preset_mode):
         loss = -delta.where(delta < 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
         rsi_14 = 100 - (100 / (1 + (gain / loss)))
         latest_rsi = rsi_14.iloc[-1]
-
-        score = 0.0
-        details = {}
         
-        # ==========================================
-        # 🎛️ 연속적 점수 부여 랭킹 알고리즘 (Gradient Scoring)
-        # ==========================================
-        if preset_mode == "SETTING_1":
-            # 1. 장기 추세 (60이평선 상승) - 최대 30점
-            if trend_60_slope > 0:
-                score += min(30, trend_60_slope * 10) # 상승 각도가 가파를수록 고득점
-                details['추세'] = f"우상향 (+{round(trend_60_slope, 1)}%)"
-            else:
-                details['추세'] = "역배열/횡보"
+        obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
 
-            # 2. 단기 투매 (20일선 기준 하락) - 최대 40점
-            if disp_20 < 100:
-                score += min(40, (100 - disp_20) * 4) # 이격도가 낮을수록(투매) 기하급수적 고득점
-                details['단기급락'] = f"투매눌림 ({round(disp_20, 1)}%)"
-            else:
-                details['단기급락'] = "조정 없음"
-
-            # 3. 세력 흡수 (거래량 폭발) - 최대 30점
-            if vol_ratio > 1.0:
-                score += min(30, vol_ratio * 10) # 거래량이 터질수록 고득점
-                details['수급(세력)'] = f"물량흡수 ({round(vol_ratio, 1)}배)"
-            else:
-                details['수급(세력)'] = "볼륨 저조"
-
-        elif preset_mode == "SETTING_2":
-            # 1. 기계적 극과매도 (RSI) - 최대 50점
-            if latest_rsi < 40:
-                score += min(50, (40 - latest_rsi) * 3)
-                details['단기급락'] = f"극과매도 (RSI {round(latest_rsi, 1)})"
-            else:
-                details['단기급락'] = f"RSI {round(latest_rsi, 1)}"
-
-            # 2. 패닉셀 이격도 - 최대 30점
-            if disp_20 < 95:
-                score += min(30, (95 - disp_20) * 3)
-                details['추세'] = f"패닉셀 ({round(disp_20, 1)}%)"
-            else:
-                details['추세'] = f"이격 {round(disp_20, 1)}%"
-
-            # 3. 매수 거래량 - 최대 20점
-            score += min(20, vol_ratio * 5)
-            details['수급(세력)'] = f"거래량 {round(vol_ratio, 1)}배"
-
-        elif preset_mode == "SETTING_3":
-            # 1. VWAP 밀착 - 최대 50점
-            vwap_abs = abs(vwap_dist)
-            if vwap_abs < 5:
-                score += max(0, 50 - (vwap_abs * 10)) # 0%에 가까울수록 50점 만점
-                details['추세'] = f"VWAP밀착 ({round(vwap_dist, 1)}%)"
-            else:
-                details['추세'] = f"VWAP이탈"
-
-            # 2. 스마트머니 OBV - 최대 30점
-            obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
-            obv_slope = (obv.iloc[-1] - obv.iloc[-5]) / abs(obv.iloc[-5]) if obv.iloc[-5] != 0 else 0
-            if obv_slope > 0:
-                score += 30; details['수급(세력)'] = "🔥OBV 우상향"
-            else:
-                details['수급(세력)'] = "자금이탈"
+        # 💡 [핵심] 5가지 전략 점수를 동시에 채점
+        s1, s2, s3, s4, s5 = 0.0, 0.0, 0.0, 0.0, 0.0
+        
+        # --- S1: 와이코프 스프링 ---
+        trend_60_slope = (ma60.iloc[-1] - ma60.iloc[-10]) / ma60.iloc[-10] * 100
+        if trend_60_slope > 0: s1 += min(30, trend_60_slope * 10)
+        if disp_20 < 100: s1 += min(40, (100 - disp_20) * 4)
+        if vol_ratio > 1.0 and (bullish_reversal or lower_tail): s1 += min(30, vol_ratio * 10)
             
-            # 3. 거래량 - 최대 20점
-            score += min(20, vol_ratio * 5)
-            details['단기급락'] = f"RSI {round(latest_rsi, 1)}"
+        # --- S2: BNF 기계적 극과매도 ---
+        if latest_rsi < 40: s2 += min(50, (40 - latest_rsi) * 3)
+        if disp_20 < 95: s2 += min(30, (95 - disp_20) * 3)
+        s2 += min(20, vol_ratio * 5)
+        
+        # --- S3: VWAP 스마트 머니 ---
+        vwap_abs = abs(vwap_dist)
+        if vwap_abs < 5: s3 += max(0, 50 - (vwap_abs * 10))
+        if obv.iloc[-1] > obv.iloc[-5]: s3 += 30
+        s3 += min(20, vol_ratio * 5)
+        
+        # --- S4: 미너비니 VCP (변동성 축소) ---
+        if ma60.iloc[-1] > ma120.iloc[-1]: s4 += 30
+        if current_price > ma60.iloc[-1]: s4 += 20
+        recent_volatility = (high.iloc[-5:].max() - low.iloc[-5:].min()) / low.iloc[-5:].min() * 100
+        if recent_volatility < 5: s4 += 30
+        elif recent_volatility < 10: s4 += 15
+        if vol_ratio < 0.8: s4 += 20 
+            
+        # --- S5: 볼린저 스퀴즈 돌파 ---
+        min_width_6mo = bb_width.rolling(120).min().iloc[-1]
+        if bb_width.iloc[-1] <= min_width_6mo * 1.3: s5 += 40 
+        if current_price >= bb_upper.iloc[-1] * 0.98: s5 += 30 
+        if vol_ratio >= 2.0: s5 += 30 
 
-        # 점수 100점 캡 및 반올림
-        score = min(100, round(score, 1))
-
-        return {
-            "종목코드": clean_ticker,
-            "종합점수": score,
-            "현재가($)": round(current_price, 2),
-            "차트추세": details.get('추세', '-'),
-            "단기낙폭상태": details.get('단기급락', '-'),
-            "세력거래량": details.get('수급(세력)', '-'),
-            "VWAP이격(%)": round(vwap_dist, 1),
-            "RSI수치": round(latest_rsi, 1)
+        # 💡 가장 점수가 높은 전략 찾기
+        scores_dict = {
+            "⭐ [S1] 와이코프 스프링": s1,
+            "🔴 [S2] BNF 극과매도": s2,
+            "🔵 [S3] VWAP 스마트머니": s3,
+            "🟣 [S4] 미너비니 VCP": s4,
+            "🔥 [S5] BB 스퀴즈 돌파": s5
         }
-    except Exception as e:
+        
+        best_strategy = max(scores_dict, key=scores_dict.get)
+        best_score = min(100, round(scores_dict[best_strategy], 1))
+
+        if best_score > 0:
+            return {
+                "종목코드": clean_ticker,
+                "적중 전략": best_strategy,  # <--- [에러 해결] 이 키값을 아래 정렬할 때 동일하게 사용!
+                "종합점수": best_score,
+                "현재가($)": round(current_price, 2),
+                "거래량배수": f"{round(vol_ratio, 1)}배",
+                "이격도(%)": round(disp_20, 1),
+                "VWAP이격(%)": round(vwap_dist, 1),
+                "RSI수치": round(latest_rsi, 1)
+            }
+    except:
         pass
     return None
 
@@ -277,11 +265,11 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "📊 차트 기술적 분석 (Technical)", 
     "🤖 AI 펀더멘털 비서 (Fundamental)", 
     "🔮 퀀트 시크릿 엔진 (Quant)",
-    "🎛️ 다중시간봉 슈퍼 스캐너 (MTF Pro)"
+    "🎛️ 5대 전략 통합 스캐너 (All-in-One)"
 ])
 
 # ------------------------------------------
-# [Tab 1, 2, 3] - 유지
+# [Tab 1, 2, 3] 
 # ------------------------------------------
 with tab1:
     col1, col2 = st.columns(2)
@@ -473,28 +461,50 @@ with tab3:
                 except Exception as e: st.error(f"에러: {e}")
 
 # ------------------------------------------
-# [Tab 4] 🎛️ 다중시간봉(MTF) & 무조건 검색 보장 랭킹 스캐너
+# [Tab 4] 🎛️ 5대 전략 동시 랭킹 스캐너 (Session State 유지)
 # ------------------------------------------
 with tab4:
-    st.subheader("🎛️ 다중시간봉(MTF) 무조건 보장형 랭킹 스캐너")
-    st.markdown("절대평가(Pass/Fail)의 깐깐한 한계를 깨고, 10,000개 이상의 미국 주식을 스캔한 뒤 **설정하신 전략에 가장 부합하는(점수가 높은) Top 50 종목을 무조건 추출**합니다.")
+    st.subheader("🎛️ 5대 슈퍼 퀀트 전략 통합 스캐너")
+    st.markdown("기존의 단일 전략 조회를 뛰어넘어, **월스트리트 5대 핵심 기법을 동시에 평가(Scoring)**합니다. 모든 종목은 자신에게 가장 유리한 최고 득점 전략으로 분류되어 하나의 요약 테이블에 표시됩니다.")
 
-    col_s1, col_s2, col_s3 = st.columns([1, 1, 1])
+    st.markdown("#### 📖 스캐너 내장 5대 핵심 전략 카테고리 요약")
+    strategy_info = pd.DataFrame({
+        "전략명": [
+            "⭐ [S1] 와이코프 스프링", 
+            "🔴 [S2] BNF 극과매도", 
+            "🔵 [S3] VWAP 스마트머니", 
+            "🟣 [S4] 미너비니 VCP", 
+            "🔥 [S5] BB 스퀴즈 돌파"
+        ],
+        "카테고리": ["역추세 / 투매 흡수", "기계적 반등 / 낙폭 과대", "수급 / 매집", "추세 / 변동성 축소", "모멘텀 / 돌파"],
+        "핵심 관점": [
+            "장기 상승 중 단기 투매를 세력이 대량 거래량으로 받아내는 자리",
+            "추세 무관, 비정상적 낙폭으로 반대매매 출회 후 V자 반등 노림",
+            "기관 평단가(VWAP) 부근에서 가격을 방어하며 자금을 은밀히 매집",
+            "상승 추세에서 변동성과 거래량이 바짝 마르며 폭발을 준비하는 패턴",
+            "에너지가 극도로 응축된 상태에서 대량 거래와 함께 상단 밴드 돌파"
+        ]
+    })
+    
+    st.table(strategy_info.set_index("전략명"))
+    st.markdown("---")
+
+    col_s1, col_s2 = st.columns(2)
     
     with col_s1:
+        # 💡 [업데이트] 슬라이더에 10,000개 추가 옵션
         scan_limit = st.select_slider(
             "📊 최대 스캔 종목 수 (API 제한 방지)",
             options=[100, 500, 1000, 2000, 5000, 10000],
             value=1000,
-            help="너무 높게 설정하면 야후 파이낸스 접속 차단으로 오류가 날 수 있습니다. (권장: 1000개)"
+            help="숫자가 클수록 더 많은 종목을 스캔하지만 5~10분 이상 소요될 수 있습니다. (10,000개 선택 시 인내심이 필요합니다!)"
         )
     
     with col_s2:
         chart_tf = st.selectbox(
-            "⏱️ 분석 기준 시간봉 선택", 
+            "⏱️ 통합 분석 기준 시간봉 선택", 
             options=['5분봉 (초단타)', '15분봉 (단타)', '60분봉 (단기)', '1일봉 (스윙/중기)', '1주봉 (장기)'], 
-            index=3,
-            help="짧은 시간봉을 선택할수록 단기 매수세(단타 타점)를 포착하는 데 유리합니다."
+            index=3
         )
         tf_map = {
             '5분봉 (초단타)': ('5d', '5m'), 
@@ -505,93 +515,83 @@ with tab4:
         }
         p_val, i_val = tf_map[chart_tf]
 
-    with col_s3:
-        preset_selection = st.radio(
-            "🎚️ 스캔 이퀄라이저 전략 세팅",
-            options=[
-                "⭐ [세팅 1] 와이코프 스프링 (장기추세 유지 + 단기투매 세력흡수)",
-                "🔴 [세팅 2] BNF식 기계적 반등 (이격도/RSI 극과매도 투매 포착)",
-                "🔵 [세팅 3] 스마트 머니 (VWAP 세력 단가 지지 + OBV 자금유입)"
-            ]
-        )
-
-    st.markdown("<br>", unsafe_allow_html=True)
+    col_btn1, col_btn2 = st.columns([3, 1])
     
-    if "세팅 1" in preset_selection:
-        st.info("💡 **와이코프 스프링(Wyckoff Spring) 전략:** 장기 60이평선은 우상향하는데 주가가 5/20이평선 아래로 급락하여 개미 투매가 나올 때, 이를 거래량(세력 물량 흡수)으로 쓸어 담는 진짜 타점을 찾습니다. (점수 비중: 단기급락 40점, 수급 30점, 추세 30점)")
-        preset_mode = "SETTING_1"
-    elif "세팅 2" in preset_selection:
-        st.info("💡 **BNF식 극과매도 전략:** 주가가 단기간에 이격도와 RSI가 비정상적으로 붕괴하여 반대 매매가 쏟아진 후, 기술적 V자 반등 탄력이 가장 높은 종목을 우선순위로 찾습니다. (점수 비중: RSI과매도 50점, 이격도 30점, 거래량 20점)")
-        preset_mode = "SETTING_2"
-    else:
-        st.info("💡 **VWAP 스마트 머니 전략:** 주가가 기관 투자자의 평균 단가(VWAP) 부근에서 밀리지 않고 버티면서, 세력 매집 지표인 OBV가 지속적으로 우상향하는 폭발 직전의 종목을 찾습니다. (점수 비중: VWAP밀착 50점, OBV매집 30점, 거래량 20점)")
-        preset_mode = "SETTING_3"
-
-    if st.button("🚀 무조건 Top 50 랭킹 스캔 시작", use_container_width=True):
-        with st.spinner(f"미국 시장 티커 확보 및 {scan_limit}개 종목 초고속 상대평가 스캐닝 중... (잠시만 기다려주세요)"):
-            try:
-                full_tickers = fetch_huge_ticker_list()
-                ticker_list = full_tickers[:scan_limit]
-                
-                if not ticker_list:
-                    st.error("종목 리스트를 가져오는 데 실패했습니다.")
-                else:
-                    매수_후보군 = []
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    completed, total = 0, len(ticker_list)
+    with col_btn1:
+        if st.button("🚀 5대 슈퍼 퀀트 전략 통합 스캔 시작", use_container_width=True):
+            with st.spinner(f"미국 시장 티커 확보 및 {scan_limit}개 종목 5대 전략 동시 채점 중... (잠시만 기다려주세요)"):
+                try:
+                    full_tickers = fetch_huge_ticker_list()
+                    ticker_list = full_tickers[:scan_limit]
                     
-                    # API Limit 회피를 위해 워커 수를 15로 안정화
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                        future_to_ticker = {
-                            executor.submit(analyze_stock_mtf_scanner, t, p_val, i_val, preset_mode): t 
-                            for t in ticker_list
-                        }
-                        for future in concurrent.futures.as_completed(future_to_ticker):
-                            res = future.result()
-                            # 💡 0점이라도 일단 담아서 무조건 결과를 보여주도록 보장
-                            if res: 매수_후보군.append(res)
-                            completed += 1
-                            if completed % 10 == 0 or completed == total:
-                                progress_bar.progress(completed / total)
-                                status_text.text(f"스캔 진행 중... ({completed}/{total})")
-                    
-                    status_text.empty()
-                    
-                    if 매수_후보군:
-                        # 💡 무조건 점수순(내림차순) 정렬 후 Top 50 추출
-                        df_scan = pd.DataFrame(매수_후보군).sort_values(by='종합점수', ascending=False).reset_index(drop=True)
-                        df_scan = df_scan.head(50)
-                        
-                        st.success(f"🎉 스캔 완료! 현재 시장 상황에서 **선택하신 전략에 점수가 가장 높은 Top {len(df_scan)} 종목**입니다.")
-                        
-                        csv_data = df_scan.to_csv(index=False).encode('utf-8-sig')
-                        st.download_button("📥 Top 50 스캔 결과 엑셀(CSV) 다운로드", data=csv_data, file_name=f"미국주식_{chart_tf.split(' ')[0]}_스캔결과.csv", mime="text/csv", use_container_width=True)
-                        
-                        st.markdown("<br>", unsafe_allow_html=True)
-                        
-                        def get_grade(score):
-                            if score >= 80: return "👑 S등급 (강력매수)"
-                            elif score >= 60: return "🟢 A등급 (매수권)"
-                            elif score >= 40: return "🟡 B등급 (분할매집)"
-                            else: return "⚪ C등급 (기준미달)"
-                            
-                        df_scan.insert(2, '투자등급', df_scan['종합점수'].apply(get_grade))
-
-                        def highlight_scan_results(val):
-                            if 'S등급' in str(val) or '🔥' in str(val): return 'background-color: #ffcccc; color: #cc0000; font-weight: bold;'
-                            elif 'A등급' in str(val): return 'background-color: #d4edda; color: #155724; font-weight: bold;'
-                            elif 'B등급' in str(val): return 'background-color: #fff3cd; color: #856404; font-weight: bold;'
-                            return ''
-
-                        styled_df = (df_scan.style
-                            .map(highlight_scan_results, subset=['투자등급', '차트추세', '단기낙폭상태', '세력거래량'])
-                            .bar(subset=['종합점수'], color='#5fba7d', vmin=0, vmax=100)
-                        )
-                        st.dataframe(styled_df, use_container_width=True, height=600)
-                        
-                        st.info("👆 위 표의 상위권 종목 코드를 **[첫 번째 탭: 차트 기술적 분석]**에 입력하여 지정하신 시간봉으로 최종 진입 타점을 확인하세요!")
+                    if not ticker_list:
+                        st.error("종목 리스트를 가져오는 데 실패했습니다.")
                     else:
-                        st.warning("야후 파이낸스 데이터 호출 제한(Rate Limit)으로 인해 종목을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.")
-            except Exception as e:
-                st.error(f"스캔 중 시스템 오류가 발생했습니다: {e}")
+                        매수_후보군 = []
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        completed, total = 0, len(ticker_list)
+                        
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                            future_to_ticker = {
+                                executor.submit(analyze_stock_multi_strategy, t, p_val, i_val): t 
+                                for t in ticker_list
+                            }
+                            for future in concurrent.futures.as_completed(future_to_ticker):
+                                res = future.result()
+                                if res: 매수_후보군.append(res)
+                                completed += 1
+                                if completed % 10 == 0 or completed == total:
+                                    progress_bar.progress(completed / total)
+                                    status_text.text(f"5대 전략 채점 중... ({completed}/{total})")
+                        
+                        status_text.empty()
+                        
+                        if 매수_후보군:
+                            # 💡 [에러 수정 완료] '매수전략' 오타를 실제 반환되는 딕셔너리 키인 '적중 전략'으로 수정
+                            df_scan = pd.DataFrame(매수_후보군).sort_values(by=['적중 전략', '종합점수'], ascending=[True, False]).reset_index(drop=True)
+                            
+                            # 점수가 너무 낮은 종목은 제외하고, 상위 50개만 노출
+                            df_scan = df_scan[df_scan['종합점수'] >= 40].head(50)
+                            
+                            st.session_state['scan_results'] = df_scan
+                        else:
+                            st.warning("스캔을 완료했으나 의미 있는 타점을 포착하지 못했습니다.")
+                except Exception as e:
+                    st.error(f"스캔 중 시스템 오류가 발생했습니다: {e}")
+
+    with col_btn2:
+        st.button("🔄 스캔 결과 초기화", on_click=reset_scan, use_container_width=True)
+
+    if st.session_state['scan_results'] is not None and not st.session_state['scan_results'].empty:
+        df_scan = st.session_state['scan_results']
+        
+        st.success(f"🎉 통합 스캔 유지 중! **최적의 전략으로 분류된 Top {len(df_scan)} 종목**입니다.")
+        
+        csv_data = df_scan.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("📥 통합 스캔 요약 결과 엑셀(CSV) 다운로드", data=csv_data, file_name=f"미국주식_5대전략통합_{chart_tf.split(' ')[0]}.csv", mime="text/csv", use_container_width=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        def get_grade(score):
+            if score >= 80: return "👑 S등급 (강력매수)"
+            elif score >= 60: return "🟢 A등급 (매수권)"
+            else: return "🟡 B등급 (분할매집)"
+            
+        if '투자등급' not in df_scan.columns:
+            df_scan.insert(2, '투자등급', df_scan['종합점수'].apply(get_grade))
+
+        def highlight_scan_results(val):
+            if 'S등급' in str(val) or '🔥' in str(val) or 'S1' in str(val): return 'background-color: #ffcccc; color: #cc0000; font-weight: bold;'
+            elif 'A등급' in str(val) or 'S4' in str(val): return 'background-color: #d4edda; color: #155724; font-weight: bold;'
+            elif 'B등급' in str(val) or 'S3' in str(val): return 'background-color: #fff3cd; color: #856404; font-weight: bold;'
+            elif 'S5' in str(val): return 'background-color: #ffe8cc; color: #e65c00; font-weight: bold;'
+            return ''
+
+        styled_df = (df_scan.style
+            .map(highlight_scan_results, subset=['투자등급', '적중 전략'])
+            .bar(subset=['종합점수'], color='#5fba7d', vmin=0, vmax=100)
+        )
+        st.dataframe(styled_df, use_container_width=True, height=600)
+        
+        st.info("👆 위 표의 상위권 종목 코드를 **[첫 번째 탭: 차트 기술적 분석]**에 입력하여 지정하신 시간봉으로 최종 진입 타점을 확인하세요!")
