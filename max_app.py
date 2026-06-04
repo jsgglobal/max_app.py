@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import ta
 import time
 import requests
+from io import StringIO
 
 # --- [UI Setup] ---
 def setup_page():
@@ -18,23 +19,23 @@ def setup_page():
 def get_sp500_tickers():
     """
     S&P 500 종목 기호를 위키피디아에서 가져오는 헬퍼 함수.
-    HTTP 403 에러 방지를 위해 requests로 User-Agent를 포함하여 HTML을 가져옵니다.
+    HTTP 403 에러 및 FileNotFoundError 방지를 위한 최종 수정본.
     """
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     
-    # 일반 브라우저처럼 보이도록 User-Agent 헤더 추가
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     
-    # HTML 데이터를 가져온 후 pandas로 파싱
     response = requests.get(url, headers=headers)
     
-    # response.text(문자열 형태의 HTML)를 read_html에 전달
-    table = pd.read_html(response.text)[0] 
+    # 2. 텍스트를 StringIO로 감싸서 pandas가 파일 경로로 오해하지 않도록 만듭니다.
+    html_data = StringIO(response.text)
+    
+    # 3. StringIO 객체를 전달합니다.
+    table = pd.read_html(html_data)[0] 
     
     tickers = table['Symbol'].tolist()
-    # 일부 티커 형식 수정 (예: BRK.B -> BRK-B)
     tickers = [ticker.replace('.', '-') for ticker in tickers]
     return tickers
 
