@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import ta
 import time
+import requests
 
 # --- [UI Setup] ---
 def setup_page():
@@ -17,10 +18,21 @@ def setup_page():
 def get_sp500_tickers():
     """
     S&P 500 종목 기호를 위키피디아에서 가져오는 헬퍼 함수.
-    실제 10,000개 시장 스캔의 축소판(UI 시연용)으로 사용.
+    HTTP 403 에러 방지를 위해 requests로 User-Agent를 포함하여 HTML을 가져옵니다.
     """
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-    table = pd.read_html(url)[0]
+    
+    # 일반 브라우저처럼 보이도록 User-Agent 헤더 추가
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    
+    # HTML 데이터를 가져온 후 pandas로 파싱
+    response = requests.get(url, headers=headers)
+    
+    # response.text(문자열 형태의 HTML)를 read_html에 전달
+    table = pd.read_html(response.text)[0] 
+    
     tickers = table['Symbol'].tolist()
     # 일부 티커 형식 수정 (예: BRK.B -> BRK-B)
     tickers = [ticker.replace('.', '-') for ticker in tickers]
