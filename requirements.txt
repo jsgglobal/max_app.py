@@ -6,3 +6,4 @@ plotly
 openai
 Pillow
 pytesseract
+ta
